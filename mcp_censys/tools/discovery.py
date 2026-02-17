@@ -1,13 +1,13 @@
 """
 Censys MCP tools module
 
-This module defines Claude-compatible tools that use the Censys Search API to
+This module defines Claude-compatible tools that use the Censys Platform API to
 perform recon on domains and IPs through natural language interactions.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from mcp_censys.client.censys import CensysClient
+from mcp_censys.client.censys import CensysClient, _extract_hits, _extract_total
 from mcp.server.fastmcp import FastMCP
 import mcp.types as types
 import sys
@@ -50,7 +50,6 @@ def lookup_domain_prompt(domain: str) -> str:
 
     Args:
         domain: The domain to lookup
-        ctx: The MCP context
 
     Returns:
         str: A prompt template for Claude to summarize domain information
@@ -59,23 +58,23 @@ def lookup_domain_prompt(domain: str) -> str:
         # {domain} - Infrastructure Analysis
 
         Perform a lookup_domain on `{domain}` ONLY - do not run any additional tools.
-        
+
         Create an intelligent analysis that identifies patterns and organizes the data into meaningful sections.
-        
+
         ## Suggested Sections
         - **Infrastructure Overview**: A brief summary of the domain's hosting approach
         - **IP Distribution**: Analyze the IP addresses and their organization
         - **DNS Architecture**: Identify naming patterns and DNS structure
         - **Service Configuration**: Examine the services and ports in use
         - **Network Presence**: Analyze the ASNs and hosting providers
-        
+
         ## Technical Data Requirements
         - Display up to 5 IPv4 addresses in a code block, with total count in parentheses
         - Only report the count of IPv6 addresses (do not list them)
         - Include up to 5 forward DNS entries and 5 reverse DNS entries with total counts
         - List all observed open ports
         - Include all ASN information
-        
+
         ## Guidelines
         1. Run ONLY the lookup_domain tool - no additional lookups
         2. Group similar information and identify patterns
@@ -96,7 +95,6 @@ def lookup_domain_detailed_prompt(domain: str) -> str:
 
     Args:
         domain: The domain to lookup in detail
-        ctx: The MCP context
 
     Returns:
         str: A prompt template for Claude to summarize detailed domain information
@@ -107,7 +105,7 @@ def lookup_domain_detailed_prompt(domain: str) -> str:
         Perform a lookup_domain_detailed on `{domain}` and create a comprehensive analysis Do not run any additional tools
 
         Begin with the sample limitation note from the response data, then analyze the infrastructure by grouping similar information into meaningful sections.
-        
+
         ## Required Sections
         - **Infrastructure Overview**: A brief summary of the overall hosting approach
         - **IP Addresses**: List all IPs in an easy-to-copy code block
@@ -115,27 +113,27 @@ def lookup_domain_detailed_prompt(domain: str) -> str:
         - **Geographic Distribution**: Analyze where servers are located
         - **Technical Configuration**: Group common technical elements (ASNs, services, OS)
         - **Content Delivery Architecture**: Identify the hosting/CDN strategy
-        
+
         ## Technical Data Format
         Present IPs and DNS entries in code blocks for easy copying:
-        
+
         ```
         IP Addresses:
         ip_address_1
         ip_address_2
         ```
-        
+
         ```
         Reverse DNS:
         dns_name_1
         dns_name_2
         ```
-        
+
         ## Important Guidelines
         1. Group similar data rather than listing each host separately
         2. Identify patterns and commonalities across all hosts
         3. ALWAYS include a dedicated section for IPs and DNS entries in code blocks
-        4. DO NOT make claims about infrastructure "quality" or "maintenance schedules" 
+        4. DO NOT make claims about infrastructure "quality" or "maintenance schedules"
         5. Present timestamps as observation timestamps only, not maintenance indicators
         6. Include significant details but avoid creating an overwhelming report
     """
@@ -153,7 +151,6 @@ async def lookup_domain(domain: str) -> dict:
 
     Args:
         domain: The domain to lookup
-        ctx: The MCP context
 
     Returns:
         dict: A dictionary containing domain infrastructure information
@@ -172,25 +169,21 @@ async def lookup_domain(domain: str) -> dict:
     # Initialize sets to collect all data
     ips, dns_names, reverse_dns, asns, ports = set(), set(), set(), set(), set()
 
-    # Use search_hosts which handles pagination automatically
     logger.info(f"Searching Censys for hosts related to {domain}")
-    search = censys.search_hosts(query, fields, per_page=100)
+    response = censys.search(query, fields, page_size=100)
+    hits = _extract_hits(response)
 
-    # Process results from all pages
-    record_count = 0
-    for page in search:
-        for r in page:  # Results are directly in the page, not in a "results" key
-            record_count += 1
-            if ip := r.get("ip"):
-                ips.add(ip)
-            dns = r.get("dns", {})
-            dns_names.update(dns.get("names", []))
-            reverse_dns.update(dns.get("reverse_dns", {}).get("names", []))
-            if asn := r.get("autonomous_system", {}).get("name"):
-                asns.add(asn)
-            ports.update(s.get("port") for s in r.get("services", []) if s.get("port"))
+    for r in hits:
+        if ip := r.get("ip"):
+            ips.add(ip)
+        dns = r.get("dns", {})
+        dns_names.update(dns.get("names", []))
+        reverse_dns.update(dns.get("reverse_dns", {}).get("names", []))
+        if asn := r.get("autonomous_system", {}).get("name"):
+            asns.add(asn)
+        ports.update(s.get("port") for s in r.get("services", []) if s.get("port"))
 
-    logger.info(f"Found {record_count} records for {domain}")
+    logger.info(f"Found {len(hits)} records for {domain}")
     logger.info(
         f"Collected {len(ips)} IPs, {len(dns_names)} DNS names, {len(reverse_dns)} reverse DNS names"
     )
@@ -217,7 +210,6 @@ async def lookup_domain_detailed(domain: str) -> dict:
 
     Args:
         domain: The domain to lookup
-        ctx: The MCP context
 
     Returns:
         dict: A dictionary containing detailed host records
@@ -227,20 +219,17 @@ async def lookup_domain_detailed(domain: str) -> dict:
     query = f"(dns.names: {domain} OR dns.reverse_dns.names: {domain})"
     per_page = 3  # Limit to just 3 records
 
-    # Use raw_search to get metadata including total count
-    logger.info(f"Performing raw search for {domain} with sample limit of {per_page}")
-    raw_response = censys.hosts.raw_search(query=query, per_page=per_page)
+    logger.info(f"Performing search for {domain} with sample limit of {per_page}")
+    response = censys.search(query, page_size=per_page)
 
-    # Extract total count and results
-    total_records = raw_response.get("result", {}).get("total", 0)
-    results = raw_response.get("result", {}).get("hits", [])
+    hits = _extract_hits(response)
+    total_records = _extract_total(response)
 
     logger.info(f"Found {total_records} total records for {domain}")
 
     # Create an informative note about available records
-    note = None
     if total_records > per_page:
-        note = f"Showing {len(results)} of {total_records} total records. There are {total_records - per_page} additional records not displayed."
+        note = f"Showing {len(hits)} of {total_records} total records. There are {total_records - per_page} additional records not displayed."
     else:
         note = f"Showing all {total_records} record(s)."
 
@@ -249,7 +238,7 @@ async def lookup_domain_detailed(domain: str) -> dict:
         "record_count": total_records,
         "sample_limit": per_page,
         "note": note,
-        "records": results,
+        "records": hits,
     }
 
 
@@ -265,47 +254,20 @@ async def lookup_ip(ip: str) -> dict:
 
     Args:
         ip: The IP address to lookup
-        ctx: The MCP context
 
     Returns:
         dict: A dictionary containing IP metadata
     """
     logger.info(f"Looking up IP metadata: {ip}")
 
-    query = f"ip: {ip}"
+    host_data = censys.get_host(ip)
 
-    # Use specific leaf fields instead of parent fields
-    fields = [
-        "ip",
-        "autonomous_system.name",
-        "autonomous_system.asn",
-        "location.country",
-        "location.continent",
-        "location.coordinates.latitude",  # Separate leaf field for latitude
-        "location.coordinates.longitude",  # Separate leaf field for longitude
-        "dns.names",
-        "dns.reverse_dns.names",
-        "services.port",
-        "services.service_name",
-        "services.transport_protocol",
-        "services.tls.certificates.leaf_data.names",
-        "last_updated_at",
-    ]
+    # Extract the host result from the response
+    result = host_data.get("result", host_data)
 
-    # Use search_hosts which handles pagination automatically
-    logger.info(f"Searching Censys for IP: {ip}")
-    search = censys.search_hosts(query, fields, per_page=1)
+    logger.info(f"Retrieved host data for IP: {ip}")
 
-    results = []
-    # We only need the first page since we're looking up a specific IP
-    for page in search:
-        results.extend(page)  # Page is directly iterable with results
-        break
-
-    result_count = len(results)
-    logger.info(f"Found {result_count} results for IP: {ip}")
-
-    return {"ip": ip, "records": results}
+    return {"ip": ip, "host": result}
 
 
 @mcp.tool(description="Find recently seen FQDNs tied to a domain in DNS and certs.")
@@ -322,7 +284,6 @@ async def new_fqdns(
     Args:
         domain: The base domain to search for
         days: Number of days back to search (default: 1)
-        ctx: The MCP context
 
     Returns:
         dict: A dictionary containing recently seen FQDNs and their sources
@@ -331,58 +292,47 @@ async def new_fqdns(
         f"Searching for recently seen FQDNs for domain: {domain} (last {days} days)"
     )
 
-    since = (datetime.now(datetime.timezone.utc) - timedelta(days=days)).strftime(
-        "%Y-%m-%d"
-    )
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     fqdns = defaultdict(lambda: {"sources": set(), "last_seen": None})
 
-    # Search for DNS records
+    # Search for DNS records in hosts
     dns_query = f"(dns.names: {domain} OR dns.reverse_dns.names: {domain}) AND last_updated_at: [{since} TO *]"
-    dns_fields = ["dns.names", "dns.reverse_dns.names", "last_updated_at"]
 
     logger.info(f"Searching DNS records since {since}")
-    dns_search = censys.search_hosts(query=dns_query, fields=dns_fields, per_page=100)
+    dns_response = censys.search(dns_query, page_size=100)
+    dns_hits = _extract_hits(dns_response)
 
-    # Process each page of DNS results
-    dns_record_count = 0
-    for page in dns_search:
-        for r in page:  # Direct iteration over page items instead of using .get()
-            dns_record_count += 1
-            last_seen = r.get("last_updated_at")
-            dns_data = r.get("dns", {})
-            for name in dns_data.get("names", []):
-                if is_domain_match(name, domain):
-                    fqdns[name]["sources"].add("hosts-dns")
-                    fqdns[name]["last_seen"] = last_seen
-            for name in dns_data.get("reverse_dns", {}).get("names", []):
-                if is_domain_match(name, domain):
-                    fqdns[name]["sources"].add("hosts-reverse")
-                    fqdns[name]["last_seen"] = last_seen
+    for r in dns_hits:
+        last_seen = r.get("last_updated_at")
+        dns_data = r.get("dns", {})
+        for name in dns_data.get("names", []):
+            if is_domain_match(name, domain):
+                fqdns[name]["sources"].add("hosts-dns")
+                fqdns[name]["last_seen"] = last_seen
+        for name in dns_data.get("reverse_dns", {}).get("names", []):
+            if is_domain_match(name, domain):
+                fqdns[name]["sources"].add("hosts-reverse")
+                fqdns[name]["last_seen"] = last_seen
 
     logger.info(
-        f"Found {dns_record_count} DNS records with {len(fqdns)} matching FQDNs"
+        f"Found {len(dns_hits)} DNS records with {len(fqdns)} matching FQDNs"
     )
 
-    # Search for certificates
+    # Search for certificates mentioning this domain
     cert_query = f"names: {domain} AND added_at: [{since} TO *]"
-    cert_fields = ["names", "added_at"]
 
     logger.info(f"Searching certificates since {since}")
-    cert_results = censys.certs.search(cert_query, fields=cert_fields, per_page=100)
+    cert_response = censys.search(cert_query, page_size=100)
+    cert_hits = _extract_hits(cert_response)
 
-    # Process certificate results
-    cert_count = 0
-    for result in cert_results:
-        items = result if isinstance(result, list) else [result]
-        for r in items:
-            cert_count += 1
-            added_at = r.get("added_at")
-            for name in r.get("names", []):
-                if is_domain_match(name, domain):
-                    fqdns[name]["sources"].add("certs")
-                    fqdns[name]["last_seen"] = added_at
+    for r in cert_hits:
+        added_at = r.get("added_at")
+        for name in r.get("names", []):
+            if is_domain_match(name, domain):
+                fqdns[name]["sources"].add("certs")
+                fqdns[name]["last_seen"] = added_at
 
-    logger.info(f"Found {cert_count} certificates with matching domains")
+    logger.info(f"Found {len(cert_hits)} certificates with matching domains")
     logger.info(f"Total unique FQDNs found: {len(fqdns)}")
 
     return {
@@ -405,44 +355,31 @@ async def host_services(ip: str) -> dict:
     """
     List exposed ports and service names for a given IP address.
 
-    Searches Censys for services running on the specified IP address and
-    returns their port numbers, service names, and when they were last seen.
+    Uses the Censys get_host endpoint for direct IP lookup instead of search,
+    providing more complete and efficient results.
 
     Args:
         ip: The IP address to lookup
-        ctx: The MCP context
 
     Returns:
         dict: A dictionary containing services running on the IP
     """
     logger.info(f"Looking up services for IP: {ip}")
 
-    query = f"ip: {ip}"
-    fields = ["services.port", "services.service_name", "last_updated_at"]
-
-    logger.info(f"Searching Censys for services on IP: {ip}")
-    search = censys.search_hosts(query, fields, per_page=100)
+    host_data = censys.get_host(ip)
+    result = host_data.get("result", host_data)
 
     services = []
-    service_count = 0
-    record_count = 0
+    for s in result.get("services", []):
+        services.append(
+            {
+                "port": s.get("port"),
+                "service": s.get("service_name"),
+                "transport_protocol": s.get("transport_protocol"),
+            }
+        )
 
-    for page in search:
-        for r in page:  # Direct iteration over page items
-            record_count += 1
-            for s in r.get("services", []):
-                service_count += 1
-                services.append(
-                    {
-                        "port": s.get("port"),
-                        "service": s.get("service_name"),
-                        "last_seen": r.get("last_updated_at"),
-                    }
-                )
-
-    logger.info(
-        f"Found {service_count} services across {record_count} records for IP: {ip}"
-    )
+    logger.info(f"Found {len(services)} services for IP: {ip}")
 
     return {"ip": ip, "services": services}
 

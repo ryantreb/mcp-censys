@@ -9,10 +9,10 @@
 
 mcp-censys turns natural language prompts into targeted Censys queries — surfacing host, DNS, cert, and service information in real-time. It's designed to work with Claude Desktop or any other Model Context Protocol (MCP) client.
 
-Built on the official Censys Python SDK, this lightweight container exposes precise reconnaissance tools through Claude-friendly functions.
+Built on the official [Censys Platform Python SDK](https://github.com/censys/censys-sdk-python), this lightweight container exposes precise reconnaissance tools through Claude-friendly functions.
 
 > [!NEW] **MCP Prompt Templates**
-> 
+>
 > This version introduces **MCP Prompt Templates** - predefined instruction sets that guide Claude's analysis of domain data. These templates provide structured guidance on how to organize and present the findings, ensuring consistent, high-quality outputs. [Learn more about MCP Prompts](https://modelcontextprotocol.io/docs/concepts/prompts).
 
 ## Features
@@ -21,9 +21,9 @@ Built on the official Censys Python SDK, this lightweight container exposes prec
 - **Domain and IP Lookup**: Get DNS names, ASN, services, and TLS context
 - **New FQDN Discovery**: Find recently seen subdomains from DNS and cert data
 - **MCP-Compatible Tools**: Use directly from Claude Desktop
-- **MCP Prompt Templates**: ✨ Built-in structured guidance templates that instruct Claude exactly how to analyze and present domain data ([learn more about MCP Prompts](https://modelcontextprotocol.io/docs/concepts/prompts))
+- **MCP Prompt Templates**: Built-in structured guidance templates that instruct Claude exactly how to analyze and present domain data ([learn more about MCP Prompts](https://modelcontextprotocol.io/docs/concepts/prompts))
 - **Dockerized with .env support**: Secure, repeatable usage
-- **Lightweight API Client**: Based on Censys Python SDK
+- **PAT Authentication**: Uses Censys Personal Access Tokens (single token, no API ID/Secret pair needed)
 
 ## Tools
 
@@ -113,24 +113,31 @@ HTTP on port 80 (last seen 2 hours ago)
 HTTPS on port 443 (last seen 2 hours ago)
 ```
 
+## Authentication
+
+mcp-censys uses **Personal Access Tokens (PAT)** for authentication. The legacy API ID + Secret pair is no longer required.
+
+1. Go to [https://search.censys.io/account/api](https://search.censys.io/account/api)
+2. Generate a Personal Access Token
+3. Set it as `CENSYS_PAT` in your environment
+
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/mcp-censys.git
+git clone https://github.com/ryantreb/mcp-censys.git
 cd mcp-censys
+
+# Create .env file with your PAT
+echo "CENSYS_PAT=your_personal_access_token" > .env
 
 # Build the Docker image
 docker build -t mcp/censys .
-
-# .env should contain:
-CENSYS_API_ID=your_censys_api_id
-CENSYS_API_SECRET=your_censys_api_secret
 ```
 
 ## MCP Configuration
 
-Add this to your Claude Desktop config:
+Add this to your Claude Desktop config or `.mcp.json`:
 
 ```json
 "censys": {
@@ -139,11 +146,24 @@ Add this to your Claude Desktop config:
     "run",
     "--rm",
     "-i",
-    "--env-file", "/Users/yourname/.env.censys",
+    "-e", "CENSYS_PAT",
     "mcp/censys"
   ]
 }
 ```
+
+Or run directly with Python:
+
+```json
+"censys": {
+  "command": "uvx",
+  "args": ["--from", "git+https://github.com/ryantreb/mcp-censys.git", "python", "main.py"],
+  "env": {
+    "CENSYS_PAT": "${CENSYS_PAT}"
+  }
+}
+```
+
 ## Screenshot
 
 mcp-censys in action via Claude Desktop, using the `lookup_domain`, `lookup_domain_detailed` and `lookup_ip` tools:
@@ -164,7 +184,7 @@ mcp-censys in action via Claude Desktop, using the `lookup_domain`, `lookup_doma
 **No Results Returned**:
 
 - Make sure the target is publicly visible
-- Check your API key and rate limits
+- Check your PAT token and rate limits
 - DNS-based results rely on recent Censys observations
 
 **Performance Tips**:
@@ -175,14 +195,15 @@ mcp-censys in action via Claude Desktop, using the `lookup_domain`, `lookup_doma
 **API Response Issues**:
 
 - If you experience errors with result formatting, ensure you're using the latest version
-- The tools handle pagination automatically - lookup_domain collects all available results, while lookup_domain_detailed shows a limited sample
-- For domains with many results, queries may take longer to complete due to multiple API requests
+- lookup_domain collects up to 100 results per query; lookup_domain_detailed shows a limited sample of 3
+- For domains with many results, queries may take longer to complete
 
 ## Limitations
 
 - new_fqdns does not represent true "first seen" FQDNs; it filters by last observed timestamps
 - This tool is intended for conversational, single-target analysis (not batch scans)
 - lookup_domain_detailed only shows 3 records to keep responses manageable, even when more are available
+- Search results are limited to a single page (up to 100 results) per query
 
 ## License
 
@@ -190,6 +211,6 @@ MIT License
 
 ## Acknowledgments
 
-- Censys Python SDK (https://github.com/censys/censys-python)
+- [Censys Platform Python SDK](https://github.com/censys/censys-sdk-python)
 - Model Context Protocol (https://modelcontextprotocol.io/)
 - Claude Desktop (https://www.anthropic.com)

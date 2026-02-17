@@ -1,60 +1,101 @@
 """
-CensysClient wrapper for the Censys Search API.
+CensysClient wrapper for the Censys Platform API.
 
-This class handles authentication and wraps host-level and certificate-level
-search functionality, returning paginated results for MCP tools.
+Uses the censys-platform SDK with Personal Access Token (PAT) authentication.
+PATs replace the legacy API ID + Secret pair.
 
 Environment variables required:
-  - CENSYS_API_ID
-  - CENSYS_API_SECRET
+  - CENSYS_PAT: Personal Access Token from https://search.censys.io/account/api
 """
 
 import os
 from dotenv import load_dotenv
-from censys.search import CensysHosts, CensysCerts
+from censys_platform import SDK
 
 # Load credentials from .env file
 load_dotenv()
 
-CENSYS_API_ID = os.getenv("CENSYS_API_ID")
-CENSYS_API_SECRET = os.getenv("CENSYS_API_SECRET")
+CENSYS_PAT = os.getenv("CENSYS_PAT")
 
-if not CENSYS_API_ID or not CENSYS_API_SECRET:
+if not CENSYS_PAT:
     raise EnvironmentError(
-        "CENSYS_API_ID and CENSYS_API_SECRET must be set in environment variables."
+        "CENSYS_PAT must be set in environment variables. "
+        "Get your token at https://search.censys.io/account/api"
     )
 
 
 class CensysClient:
     def __init__(self):
-        """Initialize the Censys Hosts and Certs clients with credentials."""
-        self.hosts = CensysHosts(api_id=CENSYS_API_ID, api_secret=CENSYS_API_SECRET)
-        self.certs = CensysCerts(api_id=CENSYS_API_ID, api_secret=CENSYS_API_SECRET)
+        """Initialize the Censys Platform SDK with PAT credentials."""
+        self.sdk = SDK(personal_access_token=CENSYS_PAT)
 
-    def search_hosts(self, query: str, fields: list, per_page: int = 10):
+    def search(self, query: str, fields: list = None, page_size: int = 10) -> dict:
         """
-        Execute a host search query and return raw paginated generator.
+        Execute a search query against Censys global data.
 
         Args:
             query (str): Censys Search Language query string
             fields (list): List of fields to return in results
-            per_page (int): Number of results per page
+            page_size (int): Number of results per page (max 100)
 
         Returns:
-            generator: Paginated response generator from Censys SDK
+            dict: Response containing 'hits' list and metadata
         """
-        return self.hosts.search(query=query, fields=fields, per_page=per_page)
+        body = {"query": query, "page_size": page_size}
+        if fields:
+            body["fields"] = fields
+        response = self.sdk.global_data.search(search_query_input_body=body)
+        return _to_dict(response)
 
-    def search_certs(self, query: str, fields: list, per_page: int = 10):
+    def get_host(self, ip: str) -> dict:
         """
-        Execute a certificate search query and return raw paginated generator.
+        Get full metadata for a specific host by IP address.
 
         Args:
-            query (str): Censys Search Language query string
-            fields (list): List of fields to return in results
-            per_page (int): Number of results per page
+            ip (str): The IP address to lookup
 
         Returns:
-            generator: Paginated response generator from Censys SDK
+            dict: Complete host metadata including services, DNS, ASN, geo
         """
-        return self.certs.search(query=query, fields=fields, per_page=per_page)
+        response = self.sdk.global_data.get_host(ip=ip)
+        return _to_dict(response)
+
+
+def _to_dict(obj) -> dict:
+    """Convert SDK response object to a plain dict."""
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    if hasattr(obj, "__dict__"):
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    return {}
+
+
+def _extract_hits(response: dict) -> list:
+    """
+    Extract hit results from a search response dict.
+
+    Handles multiple response structures the SDK may return:
+      - {"result": {"hits": [...]}}
+      - {"hits": [...]}
+      - {"result": {"query": {...}, "hits": [...]}}
+    """
+    if "result" in response:
+        result = response["result"]
+        if isinstance(result, dict) and "hits" in result:
+            return result["hits"]
+    if "hits" in response:
+        return response["hits"]
+    return []
+
+
+def _extract_total(response: dict) -> int:
+    """Extract total record count from a search response."""
+    if "result" in response:
+        result = response["result"]
+        if isinstance(result, dict):
+            return result.get("total", 0)
+    return response.get("total", 0)
